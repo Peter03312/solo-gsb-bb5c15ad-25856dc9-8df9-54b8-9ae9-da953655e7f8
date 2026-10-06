@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端调用示例：登记展品 -> 预演 -> 凭令牌提交 -> 幂等重试 -> 冲突检测 ->
-# 提交违规批次（不落记录）-> 令牌失效与重新预演 -> 查询交接链 -> 哈希链审计校验。
+# 提交违规批次（不落记录）-> 令牌失效与重新预演 -> 查询交接链 -> 哈希链审计校验 ->
+# 摘要补正（创建/幂等/冲突/422/404）-> 补正后再交接（旧令牌仍有效）-> 双链审计。
 # 用法：BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -17,6 +18,13 @@ EXHIBIT_ID="EX-DEMO-$(date +%s)"
 KEY_OK="demo-ok-${EXHIBIT_ID}"
 KEY_BAD="demo-bad-${EXHIBIT_ID}"
 KEY_RH="demo-rh-${EXHIBIT_ID}"
+KEY_C1="demo-corr1-${EXHIBIT_ID}"
+KEY_C2="demo-corr2-${EXHIBIT_ID}"
+# 交接链第 1 环的原始/补正摘要（与下方提交载荷一致）
+DG_ORIG="sha256:9f2c4a1b7e3d5f608192a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"
+DG_NEW1="sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00192837465564738291a0b1c2d3e4f5a6"
+DG_NEW2="sha256:132435465768798091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7a8b"
+DG_NEXT="sha256:aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233"
 
 echo "== 0) 健康检查 =="
 curl -s "${BASE}/health" | pp
@@ -147,3 +155,95 @@ curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/audit/verify" | pp
 
 echo; echo "== 11) 批次历史（含被驳回批次，供审计追溯；409/400 不产生报告）=="
 curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batches" | pp
+
+# ================================================================ 摘要补正
+
+echo; echo "== 12) 补正交接链第 1 环的凭证摘要（原记录与 record_hash 不改写；补正走独立链）=="
+curl -s -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C1}" \
+  -d @- <<JSON | pp
+{
+  "exhibit_id": "${EXHIBIT_ID}",
+  "chain_seq": 1,
+  "expected_digest": "${DG_ORIG}",
+  "new_digest": "${DG_NEW1}",
+  "reason": "交接凭证誊录笔误，经馆方核对纸质凭证原件后补正（核准单 NJ-2026-102）"
+}
+JSON
+
+echo; echo "== 13) 同键同载荷重试 -> HTTP 200，返回原补正单 idempotent_replay=true（即使后续再补正也先按键重放）=="
+curl -s -w '\nHTTP %{http_code}\n' -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C1}" \
+  -d @- <<JSON
+{
+  "exhibit_id": "${EXHIBIT_ID}",
+  "chain_seq": 1,
+  "expected_digest": "${DG_ORIG}",
+  "new_digest": "${DG_NEW1}",
+  "reason": "交接凭证誊录笔误，经馆方核对纸质凭证原件后补正（核准单 NJ-2026-102）"
+}
+JSON
+
+echo; echo "== 14) 同键异载荷 -> 409 =="
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C1}" \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"chain_seq\":1,\"expected_digest\":\"${DG_ORIG}\",\"new_digest\":\"${DG_NEW2}\",\"reason\":\"换个内容\"}"
+
+echo; echo "== 15) 预期值已过期（当前有效已是新摘要，仍按旧值补正）-> 409 =="
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-corr-stale-${EXHIBIT_ID}" \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"chain_seq\":1,\"expected_digest\":\"${DG_ORIG}\",\"new_digest\":\"${DG_NEW2}\",\"reason\":\"再补正一笔\"}"
+
+echo; echo "== 16) 以当前有效摘要为预期再次补正 -> 201（补正链第 2 环，prev_hash 锚第 1 环）=="
+curl -s -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C2}" \
+  -d @- <<JSON | pp
+{
+  "exhibit_id": "${EXHIBIT_ID}",
+  "chain_seq": 1,
+  "expected_digest": "${DG_NEW1}",
+  "new_digest": "${DG_NEW2}",
+  "reason": "第二次核对凭证原件发现仍有出入（核准单 NJ-2026-118）"
+}
+JSON
+
+echo; echo "== 17) 拒绝类：原因空白 / 新旧摘要相同 / 摘要格式非法 -> 422 =="
+curl -s -o /dev/null -w '空白原因 HTTP %{http_code}\n' -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-corr-r1-${EXHIBIT_ID}" \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"chain_seq\":1,\"expected_digest\":\"${DG_NEW2}\",\"new_digest\":\"${DG_ORIG}\",\"reason\":\"   \"}"
+curl -s -o /dev/null -w '新旧相同 HTTP %{http_code}\n' -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-corr-r2-${EXHIBIT_ID}" \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"chain_seq\":1,\"expected_digest\":\"${DG_NEW2}\",\"new_digest\":\"${DG_NEW2}\",\"reason\":\"x\"}"
+curl -s -o /dev/null -w '格式非法 HTTP %{http_code}\n' -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-corr-r3-${EXHIBIT_ID}" \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"chain_seq\":1,\"expected_digest\":\"${DG_NEW2}\",\"new_digest\":\"not-a-digest\",\"reason\":\"x\"}"
+
+echo; echo "== 18) 目标交接记录不存在 -> 404 =="
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X POST "${BASE}/api/v1/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-corr-r4-${EXHIBIT_ID}" \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"chain_seq\":99,\"expected_digest\":\"${DG_NEW2}\",\"new_digest\":\"${DG_ORIG}\",\"reason\":\"x\"}"
+
+echo; echo "== 19) 交接链查询：原 voucher_digest 不变，effective_voucher_digest 为最新值，corrections 为补正轨迹 =="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers" | pp
+
+echo; echo "== 20) 补正轨迹查询（展品全量 / 按目标链序号过滤）=="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/digest-corrections" | pp
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/digest-corrections?target_chain_seq=1" -o /dev/null -w '过滤查询 HTTP %{http_code}\n'
+
+echo; echo "== 21) 补正不推进交接链、不使既有预演令牌失效：补正后预演下一环并用旧令牌提交 =="
+TOKEN_AFTER_CORR="$(curl -s -X POST "${BASE}/api/v1/handover-batches/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"records\":[{\"location\":\"西安博物院交接区\",\"from_person\":\"陈晨\",\"to_person\":\"赵磊\",\"seal_no\":\"SEAL-SH-1002\",\"occurred_at\":\"2026-09-05T09:00:00+08:00\",\"voucher_digest\":\"${DG_NEXT}\"}]}" | extract_token)"
+curl -s -X POST "${BASE}/api/v1/handover-batches" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-after-corr-${EXHIBIT_ID}" \
+  -H "Handover-Token: ${TOKEN_AFTER_CORR}" \
+  -d "{\"exhibit_id\":\"${EXHIBIT_ID}\",\"records\":[{\"location\":\"西安博物院交接区\",\"from_person\":\"陈晨\",\"to_person\":\"赵磊\",\"seal_no\":\"SEAL-SH-1002\",\"occurred_at\":\"2026-09-05T09:00:00+08:00\",\"voucher_digest\":\"${DG_NEXT}\"}]}" | pp
+
+echo; echo "== 22) 双链审计复算：交接链 + 补正链各自校验并可定位首个失效环 =="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/audit/verify" | pp

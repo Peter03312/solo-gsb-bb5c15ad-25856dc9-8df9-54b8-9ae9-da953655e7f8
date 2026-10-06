@@ -10,6 +10,7 @@ Python (FastAPI) + PostgreSQL 实现的借展交接核验服务。调用方提�
 - **幂等提交**：`Idempotency-Key` 请求头去重，相同请求重试返回同一结果；同键不同载荷返回 409（令牌计入载荷身份）
 - **事务原子性**：核验失败的批次**不写入任何交接记录**、不推进链上状态（仅落核验报告供幂等重试与审计追溯）
 - **可查询审计链**：每条交接记录携带 `prev_hash` / `record_hash` 构成哈希链，提供链查询与完整性复算接口
+- **凭证摘要补正**：已入链交接记录的凭证摘要录错可提交补正单；原记录与 `record_hash` **永不改写**，补正按展品形成独立哈希链，每环锚定被补正原记录；乐观预期值防并发覆盖，幂等重放优先
 - **逐项诊断**：输出核验状态、首个断点（first_break）及每条记录的全部不合格原因
 
 ## 快速开始
@@ -24,7 +25,7 @@ docker compose up --build
 - PostgreSQL: localhost:5432 （用户/密码 `app`/`app`，库 `seals`）
 - `db/init.sql` 在数据库首次启动时自动执行，建表并写入两件种子展品（`EX-0001`、`EX-0002`）
 
-一键跑通完整演示（登记展品 → 预演取令牌 → 凭令牌提交 → 幂等重试 → 令牌失效/非法 → 409 冲突 → 违规批次 → 链查询 → 审计校验）：
+一键跑通完整演示（登记展品 → 预演取令牌 → 凭令牌提交 → 幂等重试 → 令牌失效/非法 → 409 冲突 → 违规批次 → 链查询 → 审计校验 → 摘要补正全流程 → 补正后旧令牌再交接 → 双链审计）：
 
 ```bash
 ./examples/demo.sh
@@ -60,13 +61,16 @@ docker compose up --build
 |---|---|---|
 | GET | `/health` | 健康检查 |
 | POST | `/api/v1/exhibits` | 登记展品（馆藏地/保管人/初始封签） |
-| GET | `/api/v1/exhibits/{id}` | 查询展品当前链上状态 |
+| GET | `/api/v1/exhibits/{id}` | 查询展品当前链上状态（含交接链与补正链游标） |
 | POST | `/api/v1/handover-batches/rehearse` | **预演交接批次（只读）**：同载荷规则核验，返回逐条结果、首个断点与状态令牌，不写任何数据 |
 | POST | `/api/v1/handover-batches` | **提交交接批次并核验**（需 `Idempotency-Key` 头，可选 `Handover-Token` 头） |
 | GET | `/api/v1/handover-batches/{batch_id}` | 查询批次核验报告 |
-| GET | `/api/v1/exhibits/{id}/handovers` | 查询完整交接链（含哈希） |
-| GET | `/api/v1/exhibits/{id}/audit/verify` | 重放复算哈希链，校验完整性 |
+| GET | `/api/v1/exhibits/{id}/handovers` | 查询完整交接链（原摘要/当前有效摘要/补正轨迹，含哈希） |
+| GET | `/api/v1/exhibits/{id}/audit/verify` | 复算交接链与补正链两条哈希链，校验完整性并定位首个失效环 |
 | GET | `/api/v1/exhibits/{id}/batches` | 批次历史（含被驳回批次，可按 `status` 过滤） |
+| POST | `/api/v1/digest-corrections` | **提交凭证摘要补正单**（需 `Idempotency-Key` 头），原交接记录不改写 |
+| GET | `/api/v1/digest-corrections/{correction_id}` | 按补正单号查询单张补正单 |
+| GET | `/api/v1/exhibits/{id}/digest-corrections` | 查询展品补正轨迹（可按 `target_chain_seq` 过滤） |
 
 ## 调用示例
 
@@ -184,8 +188,97 @@ curl http://localhost:8000/api/v1/exhibits/EX-0001/audit/verify
 `audit/verify` 逐条复算 `record_hash = sha256(prev_hash ‖ 规范化业务字段)` 并比对链头，任何篡改、删除、乱序都会定位到首个失效环：
 
 ```json
-{"exhibit_id":"EX-0001","chain_length":3,"valid":true,"first_invalid_seq":null,"detail":"哈希链完整，与展品当前状态一致"}
+{
+  "exhibit_id": "EX-0001",
+  "chain_length": 3,
+  "valid": true,
+  "first_invalid_seq": null,
+  "first_invalid_correction_seq": null,
+  "detail": "交接链与补正链均完整，与展品当前状态一致",
+  "chains": {
+    "handovers": {"chain_length": 3, "valid": true, "first_invalid_seq": null, "detail": "哈希链完整，与展品当前状态一致"},
+    "corrections": {"chain_length": 0, "valid": true, "first_invalid_seq": null, "detail": "补正链完整，各环锚点与预期摘要均一致"}
+  }
+}
 ```
+
+> 顶层字段保持原有含义（`first_invalid_seq` 仍指向交接链首个失效环）；补正链的复算结果见 `chains.corrections` 与 `first_invalid_correction_seq`。
+
+### 7. 已入链凭证摘要补正
+
+已入链交接记录的凭证摘要录错后，馆方可提交补正单。**原交接记录及其 `record_hash` 永不改写**，补正按展品追加一条独立哈希链（与交接链互不推进）。
+
+请求字段：展品编号 `exhibit_id`、被补正记录的**链序号** `chain_seq`、`expected_digest`（预期的当前有效摘要）、`new_digest`（新摘要）、`reason`（补正原因），并携带 `Idempotency-Key` 请求头：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/digest-corrections \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: corr-2026-1001-01' \
+  -d @examples/correct-digest.json
+```
+
+受理与拒绝规则：
+
+| 情形 | 结果 |
+|---|---|
+| 目标记录存在、原因非空、新旧不同、预期值等于当前有效摘要 | `201` 创建补正单，追加补正链一环 |
+| 同键同载荷重试 | `200` 返回**原补正单**，`idempotent_replay=true` |
+| 同键异载荷（任一字段不同） | `409` |
+| `expected_digest` 与当前有效摘要不符（含并发下的落败者） | `409`，请以最新有效摘要重新补正 |
+| 目标交接记录不存在 / 展品不存在 | `404` |
+| 原因为空白、新旧摘要相同、摘要格式非法 | `422` |
+
+要点：
+
+- **幂等重放优先**：即使提交后该记录又发生过新的补正，同键同载荷重试仍先按幂等键返回原补正单，不再校验预期值。
+- **并发仅一笔生效**：不同幂等键以同一预期值并发补正同一记录时，展品行锁串行化，仅第一笔 `201`，其余 `409`。
+- **当前有效摘要**：某条交接记录的当前有效摘要 = 其最新一笔补正的 `new_digest`；无补正则等于原始 `voucher_digest`。
+- **补正不推进交接链**：`chain_length`/`chain_head_hash` 不变，已签发的预演令牌**继续有效**，原提交接口与响应字段保持兼容。
+
+补正单响应（含被补正原记录锚点与补正链哈希）：
+
+```json
+{
+  "correction_id": "…",
+  "exhibit_id": "EX-0001",
+  "correction_seq": 1,
+  "target_chain_seq": 1,
+  "expected_digest": "sha256:9f2c…",
+  "new_digest": "sha256:0f1e…",
+  "reason": "交接凭证誊录笔误，经馆方核对纸质凭证原件后补正（核准单 NJ-2026-102）",
+  "original_digest": "sha256:9f2c…",
+  "target_record_hash": "b22e17f3…",
+  "prev_hash": "GENESIS",
+  "correction_hash": "ad5e29d3…",
+  "created_at": "2026-10-06T03:37:34.103149Z",
+  "idempotent_replay": false
+}
+```
+
+查询补正轨迹（可按目标链序号过滤）：
+
+```bash
+curl http://localhost:8000/api/v1/exhibits/EX-0001/digest-corrections
+curl 'http://localhost:8000/api/v1/exhibits/EX-0001/digest-corrections?target_chain_seq=1'
+curl http://localhost:8000/api/v1/digest-corrections/{correction_id}
+```
+
+### 8. 交接链查询中的原摘要 / 当前有效摘要 / 补正轨迹
+
+`GET /handovers` 的每条记录在原有字段之外新增：
+
+- `voucher_digest`：**原始**交接凭证摘要（永不改写，旧字段语义不变）；
+- `effective_voucher_digest`：**当前有效**摘要；
+- `corrections`：该记录的补正轨迹（按补正链顺序，含每笔的预期/新摘要、原因与哈希）。
+
+### 9. 补正链审计
+
+`GET /audit/verify` 同时复算两条链：
+
+- 交接链复算 `record_hash`、`prev_hash` 衔接与链头一致性；
+- 补正链按 `correction_seq` 复算 `correction_hash = sha256(prev_hash ‖ 补正字段 ‖ 原记录锚点)`，校验：链序连续、`prev_hash` 衔接、`target_record_hash` 与当前交接链记录一致、`original_digest` 快照一致、`expected_digest` 与重放得到的当时有效摘要一致、链尾与展品补正游标一致。
+
+补正单被篡改、被删除、乱序，或被锚定的原记录被改写，都会定位到**首个失效环**（`first_invalid_correction_seq`）。
 
 ## 设计说明
 
@@ -195,6 +288,9 @@ curl http://localhost:8000/api/v1/exhibits/EX-0001/audit/verify
 - **原子性**：核验、批次报告、交接记录、展品链上状态推进全部在单事务内完成；`REJECTED` 批次仅落 `batches` 报告行（用于幂等重试返回同一结果与审计追溯），`handover_records` 与 `exhibits` 状态零变更；令牌 `400/409` 在报告写入前中止事务，批次表也不留痕。
 - **并发一致性**：处理批次时对展品行 `SELECT ... FOR UPDATE`，串行化同一展品的链推进，防止并发批次造成链序号/链头错乱。
 - **哈希链**：首环 `prev_hash = GENESIS`，之后每环指向前环 `record_hash`；时间统一规范化为 UTC 微秒精度 `Z` 格式后参与哈希，保证写入与复算一致。
+- **摘要补正**：补正单写入 `digest_corrections` 表，原交接记录与其 `record_hash` 永不变更。补正按展品维护**独立哈希链**（展品上新增 `correction_seq` / `correction_head_hash` 游标），首环 `prev_hash=GENESIS`，每环还以 `target_record_hash` 锚定被补正原记录、以 `original_digest` 快照原始摘要；审计复算时重放每笔的 `expected_digest` 与当时有效摘要是否一致。
+- **补正并发与幂等**：提交补正同样在展品行 `FOR UPDATE` 锁内完成「查当前有效摘要 → 比对预期值 → 追加补正环 → 推进补正游标」，不同幂等键以同一预期值并发时仅首笔生效、余者 409；幂等键唯一约束兜底并发插入。幂等查表在一切状态校验之前，因此**同键同载荷永远先重放原单**（即使后续补正已发生），同键异载荷 409。
+- **补正不影响交接链/令牌**：补正只动补正链游标，不修改 `chain_length` / `chain_head_hash`，因此预演令牌的链快照比对继续成立；原提交接口路径、请求与响应字段均保持不变（交接链查询仅以新增字段呈现有效摘要与补正轨迹）。
 
 ## 本地开发与测试
 
@@ -205,25 +301,25 @@ pytest tests/                 # 规则引擎 + 令牌单测（无数据库依赖
 uvicorn app.main:app --reload # 需本地 PostgreSQL 并执行 db/init.sql
 ```
 
-`tests/test_api_rehearsal.py` 为预演/令牌端到端测试，需可达的 PostgreSQL，
+`tests/test_api_rehearsal.py` 为预演/令牌端到端测试、`tests/test_api_corrections.py` 为补正单/双链审计端到端测试（含并发与篡改定位），需可达的 PostgreSQL，
 通过 `DATABASE_URL` 指定；数据库不可达时自动跳过：
 
 ```bash
-DATABASE_URL='postgresql://app:app@localhost:5432/seals' pytest tests/test_api_rehearsal.py
+DATABASE_URL='postgresql://app:app@localhost:5432/seals' pytest tests/
 ```
 
 ## 目录结构
 
 ```
 app/
-  main.py        # FastAPI 路由与事务编排（含 /rehearse 与令牌校验）
+  main.py        # FastAPI 路由与事务编排（批次、预演令牌、摘要补正、双链审计）
   validation.py  # 规则引擎（纯标准库，可独立单测）
   tokens.py      # 展品状态令牌：签发/验签/链快照比对（纯标准库，可独立单测）
-  hashing.py     # 规范化序列化、请求指纹（含令牌身份）、哈希链
-  schemas.py     # 请求/响应模型
+  hashing.py     # 规范化序列化、请求指纹、交接链与补正链哈希
+  schemas.py     # 请求/响应模型（含补正单模型）
   db.py          # 连接与启动等待
-db/init.sql      # 建表 + 种子展品（Compose 首启自动执行）
-examples/        # accept/reject 示例载荷与端到端 demo.sh（含预演流程）
-tests/           # 规则引擎、令牌单元测试与预演端到端测试
+db/init.sql      # 建表（exhibits/batches/handover_records/digest_corrections）+ 种子展品
+examples/        # accept/reject/correct-digest 示例载荷与端到端 demo.sh
+tests/           # 规则引擎、令牌、哈希单元测试与预演/补正端到端测试
 Dockerfile  docker-compose.yml  requirements*.txt
 ```

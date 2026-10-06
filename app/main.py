@@ -5,19 +5,27 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from . import __version__
 from .db import get_conn, wait_for_db
-from .hashing import GENESIS_HASH, record_hash, request_hash
+from .hashing import (
+    GENESIS_HASH,
+    correction_hash,
+    correction_request_hash,
+    record_hash,
+    request_hash,
+)
 from .schemas import (
     AuditVerifyOut,
     BatchReport,
     BatchRequest,
     BatchSummary,
     ChainOut,
+    CorrectionOut,
+    CorrectionRequest,
     ExhibitCreate,
     ExhibitOut,
     RehearsalOut,
@@ -96,6 +104,24 @@ def _replay_report(row: dict) -> dict:
     report = dict(row["report"])
     report["idempotent_replay"] = True
     return report
+
+
+def _serialize_correction(row: dict, idempotent_replay: bool = False) -> dict:
+    return {
+        "correction_id": str(row["correction_id"]),
+        "exhibit_id": row["exhibit_id"],
+        "correction_seq": row["correction_seq"],
+        "target_chain_seq": row["target_chain_seq"],
+        "expected_digest": row["expected_digest"],
+        "new_digest": row["new_digest"],
+        "reason": row["reason"],
+        "original_digest": row["original_digest"],
+        "target_record_hash": row["target_record_hash"],
+        "prev_hash": row["prev_hash"],
+        "correction_hash": row["correction_hash"],
+        "created_at": row["created_at"],
+        "idempotent_replay": idempotent_replay,
+    }
 
 
 # ---------------------------------------------------------------- 健康检查
@@ -348,12 +374,223 @@ def get_handover_batch(batch_id: uuid.UUID):
     return row["report"]
 
 
+# ---------------------------------------------------------------- 摘要补正单
+
+
+def _get_correction_or_404(conn, correction_id: uuid.UUID) -> dict:
+    row = conn.execute(
+        "SELECT * FROM digest_corrections WHERE correction_id = %s",
+        (correction_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"补正单「{correction_id}」不存在")
+    return row
+
+
+@app.post(
+    "/api/v1/digest-corrections",
+    response_model=CorrectionOut,
+    status_code=201,
+    tags=["corrections"],
+)
+def submit_digest_correction(
+    payload: CorrectionRequest,
+    response: Response,
+    idempotency_key: str = Header(min_length=1, max_length=128),
+):
+    """提交凭证摘要补正单（原交接记录与 record_hash 永不改写）。
+
+    - 目标交接记录不存在 -> 404；原因空白、新旧摘要相同、摘要格式非法 -> 422；
+      `expected_digest` 与该记录当前有效摘要不符 -> 409（乐观并发，
+      不同幂等键以同一预期值并发补正仅一笔生效）。
+    - 幂等：同键同载荷重试返回原补正单（`idempotent_replay=true`，HTTP 200）；
+      同键异载荷 -> 409。幂等重放先于一切状态校验，即使后续又发生补正也先按键重放。
+    - 补正按展品追加独立哈希链，不推进交接链、不改变展品链头，
+      既有预演令牌继续有效。
+    """
+    req_hash = correction_request_hash(
+        payload.exhibit_id,
+        payload.chain_seq,
+        payload.expected_digest,
+        payload.new_digest,
+        payload.reason,
+    )
+
+    try:
+        with get_conn() as conn:
+            # 1) 幂等优先：先按键重放，即使链已变化/预期已失效也不做状态校验
+            existing = conn.execute(
+                "SELECT * FROM digest_corrections WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的请求载荷",
+                    )
+                if response is not None:
+                    response.status_code = 200
+                return _serialize_correction(existing, idempotent_replay=True)
+
+            # 2) 锁定展品行：串行化同一展品的补正与链游标推进
+            exhibit = conn.execute(
+                "SELECT * FROM exhibits WHERE exhibit_id = %s FOR UPDATE",
+                (payload.exhibit_id,),
+            ).fetchone()
+            if not exhibit:
+                raise HTTPException(
+                    status_code=404, detail=f"展品「{payload.exhibit_id}」不存在"
+                )
+
+            # 3) 目标交接记录必须存在
+            target = conn.execute(
+                """
+                SELECT chain_seq, voucher_digest, record_hash
+                  FROM handover_records
+                 WHERE exhibit_id = %s AND chain_seq = %s
+                """,
+                (payload.exhibit_id, payload.chain_seq),
+            ).fetchone()
+            if not target:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"展品「{payload.exhibit_id}」不存在链序号为 {payload.chain_seq} 的交接记录",
+                )
+
+            # 4) 当前有效摘要 = 该记录最新一笔补正的新摘要（无补正则为原始摘要）
+            latest = conn.execute(
+                """
+                SELECT new_digest
+                  FROM digest_corrections
+                 WHERE exhibit_id = %s AND target_chain_seq = %s
+                 ORDER BY correction_seq DESC
+                 LIMIT 1
+                """,
+                (payload.exhibit_id, payload.chain_seq),
+            ).fetchone()
+            current_effective = latest["new_digest"] if latest else target["voucher_digest"]
+            if payload.expected_digest != current_effective:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"预期当前有效摘要与实际不符：预期「{payload.expected_digest}」，"
+                        f"当前有效为「{current_effective}」，请以最新有效摘要重新补正"
+                    ),
+                )
+
+            # 5) 追加补正链一环（独立游标；交接链 chain_length/chain_head_hash 不变）
+            correction_id = uuid.uuid4()
+            now = datetime.now(timezone.utc)
+            next_seq = exhibit["correction_seq"] + 1
+            prev_hash = exhibit["correction_head_hash"]
+            chash = correction_hash(
+                prev_hash=prev_hash,
+                exhibit_id=payload.exhibit_id,
+                correction_seq=next_seq,
+                correction_id=correction_id,
+                target_chain_seq=payload.chain_seq,
+                target_record_hash=target["record_hash"],
+                expected_digest=payload.expected_digest,
+                new_digest=payload.new_digest,
+                reason=payload.reason,
+                created_at=now,
+            )
+            conn.execute(
+                """
+                INSERT INTO digest_corrections
+                    (correction_id, idempotency_key, exhibit_id, target_chain_seq,
+                     expected_digest, new_digest, reason, target_record_hash,
+                     original_digest, correction_seq, prev_hash, correction_hash,
+                     request_hash, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (correction_id, idempotency_key, payload.exhibit_id, payload.chain_seq,
+                 payload.expected_digest, payload.new_digest, payload.reason,
+                 target["record_hash"], target["voucher_digest"], next_seq, prev_hash,
+                 chash, req_hash, now),
+            )
+            conn.execute(
+                """
+                UPDATE exhibits
+                   SET correction_seq = %s, correction_head_hash = %s
+                 WHERE exhibit_id = %s
+                """,
+                (next_seq, chash, payload.exhibit_id),
+            )
+            row = _get_correction_or_404(conn, correction_id)
+            if response is not None:
+                response.status_code = 201
+            return _serialize_correction(row)
+    except UniqueViolation:
+        # 并发下同键插入：回滚后按已存补正单重放（等价于后到的重试）
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM digest_corrections WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+        if existing and existing["request_hash"] == req_hash:
+            if response is not None:
+                response.status_code = 200
+            return _serialize_correction(existing, idempotent_replay=True)
+        raise HTTPException(status_code=409, detail="同一 Idempotency-Key 提交了不同的请求载荷")
+
+
+@app.get(
+    "/api/v1/digest-corrections/{correction_id}",
+    response_model=CorrectionOut,
+    tags=["corrections"],
+)
+def get_digest_correction(correction_id: uuid.UUID):
+    """按补正单号查询单张补正单（含原记录锚点与补正链哈希）。"""
+    with get_conn() as conn:
+        row = _get_correction_or_404(conn, correction_id)
+    return _serialize_correction(row)
+
+
+@app.get(
+    "/api/v1/exhibits/{exhibit_id}/digest-corrections",
+    response_model=list[CorrectionOut],
+    tags=["corrections"],
+)
+def list_digest_corrections(exhibit_id: str, target_chain_seq: int | None = Query(default=None)):
+    """查询展品的补正轨迹（按补正链顺序；可按被补正的链序号过滤）。"""
+    with get_conn() as conn:
+        exhibit = conn.execute(
+            "SELECT exhibit_id FROM exhibits WHERE exhibit_id = %s",
+            (exhibit_id,),
+        ).fetchone()
+        if not exhibit:
+            raise HTTPException(status_code=404, detail=f"展品「{exhibit_id}」不存在")
+        if target_chain_seq is not None:
+            rows = conn.execute(
+                """
+                SELECT * FROM digest_corrections
+                 WHERE exhibit_id = %s AND target_chain_seq = %s
+                 ORDER BY correction_seq
+                """,
+                (exhibit_id, target_chain_seq),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM digest_corrections WHERE exhibit_id = %s ORDER BY correction_seq",
+                (exhibit_id,),
+            ).fetchall()
+    return [_serialize_correction(r) for r in rows]
+
+
 # ---------------------------------------------------------------- 审计链
 
 
 @app.get("/api/v1/exhibits/{exhibit_id}/handovers", response_model=ChainOut, tags=["audit"])
 def list_handovers(exhibit_id: str):
-    """查询展品的完整交接链（含每条记录的链式哈希）。"""
+    """查询展品的完整交接链（含每条记录的链式哈希）。
+
+    每条记录同时呈现：
+    - `voucher_digest`：原始交接凭证摘要（永不改写）；
+    - `effective_voucher_digest`：当前有效摘要（最新一笔补正的新摘要，无补正则同原值）；
+    - `corrections`：该记录的补正轨迹（按补正链顺序）。
+    """
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -366,14 +603,52 @@ def list_handovers(exhibit_id: str):
             """,
             (exhibit_id,),
         ).fetchall()
+        corrections = conn.execute(
+            """
+            SELECT correction_id, correction_seq, target_chain_seq, expected_digest,
+                   new_digest, reason, correction_hash, created_at
+              FROM digest_corrections
+             WHERE exhibit_id = %s
+             ORDER BY correction_seq
+            """,
+            (exhibit_id,),
+        ).fetchall()
+
+    trail: dict[int, list[dict]] = {}
+    for c in corrections:
+        trail.setdefault(c["target_chain_seq"], []).append({
+            "correction_id": str(c["correction_id"]),
+            "correction_seq": c["correction_seq"],
+            "target_chain_seq": c["target_chain_seq"],
+            "expected_digest": c["expected_digest"],
+            "new_digest": c["new_digest"],
+            "reason": c["reason"],
+            "correction_hash": c["correction_hash"],
+            "created_at": c["created_at"],
+        })
+
+    records = []
     for r in rows:
         r["batch_id"] = str(r["batch_id"])
-    return {"exhibit_id": exhibit_id, "chain_length": len(rows), "records": rows}
+        rec_trail = trail.get(r["chain_seq"], [])
+        r["effective_voucher_digest"] = (
+            rec_trail[-1]["new_digest"] if rec_trail else r["voucher_digest"]
+        )
+        r["corrections"] = rec_trail
+        records.append(r)
+    return {"exhibit_id": exhibit_id, "chain_length": len(rows), "records": records}
 
 
 @app.get("/api/v1/exhibits/{exhibit_id}/audit/verify", response_model=AuditVerifyOut, tags=["audit"])
 def verify_audit_chain(exhibit_id: str):
-    """重放哈希链：逐条复算 record_hash 并校验 prev_hash 衔接与链头一致性。"""
+    """重放两条哈希链：交接链与摘要补正链各自独立复算，定位首个失效环。
+
+    - 交接链：逐条复算 record_hash 并校验 prev_hash 衔接与链头一致性；
+    - 补正链：逐条复算 correction_hash、校验 prev_hash 衔接、锚点 target_record_hash
+      与原记录一致、expected_digest 与该环之前的当前有效摘要一致，再校验链尾游标；
+    - 顶层 first_invalid_seq 仍指向交接链（兼容原字段），
+      补正链首个失效环见 first_invalid_correction_seq 与 chains.corrections。
+    """
     with get_conn() as conn:
         exhibit = conn.execute(
             "SELECT * FROM exhibits WHERE exhibit_id = %s", (exhibit_id,)
@@ -384,7 +659,15 @@ def verify_audit_chain(exhibit_id: str):
             "SELECT * FROM handover_records WHERE exhibit_id = %s ORDER BY chain_seq",
             (exhibit_id,),
         ).fetchall()
+        corr_rows = conn.execute(
+            "SELECT * FROM digest_corrections WHERE exhibit_id = %s ORDER BY correction_seq",
+            (exhibit_id,),
+        ).fetchall()
 
+    # -- 交接链 -------------------------------------------------------------
+    handover_valid = True
+    first_invalid_seq: int | None = None
+    handover_detail = "哈希链完整，与展品当前状态一致"
     prev = GENESIS_HASH
     for row in rows:
         expected = record_hash(
@@ -401,29 +684,122 @@ def verify_audit_chain(exhibit_id: str):
             voucher_digest=row["voucher_digest"],
         )
         if row["prev_hash"] != prev or row["record_hash"] != expected:
-            return {
-                "exhibit_id": exhibit_id,
-                "chain_length": len(rows),
-                "valid": False,
-                "first_invalid_seq": row["chain_seq"],
-                "detail": f"第 {row['chain_seq']} 环哈希校验失败：记录被篡改、删除或顺序被调换",
-            }
+            handover_valid = False
+            first_invalid_seq = row["chain_seq"]
+            handover_detail = (
+                f"交接链第 {row['chain_seq']} 环哈希校验失败：记录被篡改、删除或顺序被调换"
+            )
+            break
         prev = row["record_hash"]
 
-    if prev != exhibit["chain_head_hash"] or len(rows) != exhibit["chain_length"]:
-        return {
-            "exhibit_id": exhibit_id,
-            "chain_length": len(rows),
-            "valid": False,
-            "first_invalid_seq": None,
-            "detail": "链尾哈希或链长与展品当前状态不一致",
-        }
+    if handover_valid and (
+        prev != exhibit["chain_head_hash"] or len(rows) != exhibit["chain_length"]
+    ):
+        handover_valid = False
+        first_invalid_seq = None
+        handover_detail = "交接链尾哈希或链长与展品当前状态不一致"
+
+    # -- 补正链 -------------------------------------------------------------
+    # 原记录索引，供锚点与有效摘要复算
+    records_by_seq = {r["chain_seq"]: r for r in rows}
+    # 每个被补正目标的「当前有效摘要」随补正链推进重放
+    effective: dict[int, str] = {}
+    corr_valid = True
+    first_invalid_corr: int | None = None
+    corr_detail = "补正链完整，各环锚点与预期摘要均一致"
+    corr_prev = GENESIS_HASH
+    for idx, crow in enumerate(corr_rows, start=1):
+        cseq = crow["correction_seq"]
+        tseq = crow["target_chain_seq"]
+        invalid_reason: str | None = None
+
+        if cseq != idx:
+            invalid_reason = f"补正链第 {cseq} 环链序号不连续（存在删除或乱序）"
+        elif crow["prev_hash"] != corr_prev:
+            invalid_reason = f"补正链第 {cseq} 环前驱哈希不衔接（补正单被删除、插入或调换）"
+        else:
+            target = records_by_seq.get(tseq)
+            if target is None:
+                invalid_reason = f"补正链第 {cseq} 环锚定的交接链第 {tseq} 环不存在"
+            else:
+                expected_corr = correction_hash(
+                    prev_hash=corr_prev,
+                    exhibit_id=crow["exhibit_id"],
+                    correction_seq=cseq,
+                    correction_id=crow["correction_id"],
+                    target_chain_seq=tseq,
+                    target_record_hash=crow["target_record_hash"],
+                    expected_digest=crow["expected_digest"],
+                    new_digest=crow["new_digest"],
+                    reason=crow["reason"],
+                    created_at=crow["created_at"],
+                )
+                if crow["correction_hash"] != expected_corr:
+                    invalid_reason = f"补正链第 {cseq} 环哈希校验失败：补正单被篡改"
+                elif crow["target_record_hash"] != target["record_hash"]:
+                    invalid_reason = (
+                        f"补正链第 {cseq} 环锚点失效：被补正原记录哈希与锚定值不一致"
+                    )
+                elif crow["original_digest"] != target["voucher_digest"]:
+                    invalid_reason = (
+                        f"补正链第 {cseq} 环记录的原始摘要快照与交接链第 {tseq} 环不一致"
+                    )
+                else:
+                    prior_effective = effective.get(tseq, target["voucher_digest"])
+                    if crow["expected_digest"] != prior_effective:
+                        invalid_reason = (
+                            f"补正链第 {cseq} 环预期摘要与重放得到的当前有效摘要不一致"
+                            "（并发补正/状态被改写）"
+                        )
+
+        if invalid_reason is not None:
+            corr_valid = False
+            first_invalid_corr = cseq
+            corr_detail = invalid_reason
+            break
+
+        corr_prev = crow["correction_hash"]
+        effective[tseq] = crow["new_digest"]
+
+    if corr_valid and (
+        corr_prev != exhibit["correction_head_hash"]
+        or len(corr_rows) != exhibit["correction_seq"]
+    ):
+        corr_valid = False
+        first_invalid_corr = None
+        corr_detail = "补正链尾哈希或链长与展品补正游标不一致"
+
+    overall_valid = handover_valid and corr_valid
+    if overall_valid:
+        detail = "交接链与补正链均完整，与展品当前状态一致"
+    elif not handover_valid and not corr_valid:
+        detail = f"{handover_detail}；{corr_detail}"
+    elif not handover_valid:
+        detail = handover_detail
+    else:
+        detail = corr_detail
+
     return {
         "exhibit_id": exhibit_id,
         "chain_length": len(rows),
-        "valid": True,
-        "first_invalid_seq": None,
-        "detail": "哈希链完整，与展品当前状态一致",
+        "valid": overall_valid,
+        "first_invalid_seq": first_invalid_seq,
+        "detail": detail,
+        "first_invalid_correction_seq": first_invalid_corr,
+        "chains": {
+            "handovers": {
+                "chain_length": len(rows),
+                "valid": handover_valid,
+                "first_invalid_seq": first_invalid_seq,
+                "detail": handover_detail,
+            },
+            "corrections": {
+                "chain_length": len(corr_rows),
+                "valid": corr_valid,
+                "first_invalid_seq": first_invalid_corr,
+                "detail": corr_detail,
+            },
+        },
     }
 
 

@@ -41,6 +41,24 @@ def request_hash(exhibit_id: str, records: list[dict], handover_token: str | Non
     return sha256_hex(canonical_json(payload))
 
 
+def correction_request_hash(
+    exhibit_id: str,
+    target_chain_seq: int,
+    expected_digest: str,
+    new_digest: str,
+    reason: str,
+) -> str:
+    """补正单请求体指纹：同幂等键下任一字段不同即视为异载荷（409）。"""
+    payload = {
+        "exhibit_id": exhibit_id,
+        "target_chain_seq": target_chain_seq,
+        "expected_digest": expected_digest,
+        "new_digest": new_digest,
+        "reason": reason,
+    }
+    return sha256_hex(canonical_json(payload))
+
+
 def record_hash(
     *,
     prev_hash: str,
@@ -71,5 +89,39 @@ def record_hash(
         "seal_change_reason": seal_change_reason or "",
         "occurred_at": norm_ts(occurred_at),
         "voucher_digest": voucher_digest,
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def correction_hash(
+    *,
+    prev_hash: str,
+    exhibit_id: str,
+    correction_seq: int,
+    correction_id,
+    target_chain_seq: int,
+    target_record_hash: str,
+    expected_digest: str,
+    new_digest: str,
+    reason: str,
+    created_at: datetime,
+) -> str:
+    """单张补正单的链式哈希：correction_hash = sha256(prev_hash ‖ 补正字段 ‖ 原记录锚点)。
+
+    补正链与交接链相互独立：前驱只引用上一补正单的哈希；
+    另以 target_record_hash 锚定被补正的原交接记录，
+    原记录被篡改或锚点被调换都会在审计复算时暴露为首个失效环。
+    """
+    payload = {
+        "prev_hash": prev_hash,
+        "exhibit_id": exhibit_id,
+        "correction_seq": correction_seq,
+        "correction_id": str(correction_id),
+        "target_chain_seq": target_chain_seq,
+        "target_record_hash": target_record_hash,
+        "expected_digest": expected_digest,
+        "new_digest": new_digest,
+        "reason": reason,
+        "created_at": norm_ts(created_at),
     }
     return sha256_hex(canonical_json(payload))

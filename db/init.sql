@@ -10,8 +10,16 @@ CREATE TABLE IF NOT EXISTS exhibits (
     last_time       TIMESTAMPTZ,                        -- 最近一环交接时间
     chain_length    BIGINT      NOT NULL DEFAULT 0,
     chain_head_hash TEXT        NOT NULL DEFAULT 'GENESIS',
+    -- 摘要补正链独立游标：补正不推进交接链，二者互不影响
+    correction_seq        BIGINT NOT NULL DEFAULT 0,
+    correction_head_hash  TEXT   NOT NULL DEFAULT 'GENESIS',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 兼容已初始化过的旧库（Compose 数据卷已存在时 init.sql 不会重跑，
+-- 此处的 IF NOT EXISTS 供手工重放/既有环境升级使用）。
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS correction_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS correction_head_hash TEXT NOT NULL DEFAULT 'GENESIS';
 
 CREATE TABLE IF NOT EXISTS batches (
     batch_id        UUID        PRIMARY KEY,
@@ -47,6 +55,34 @@ CREATE TABLE IF NOT EXISTS handover_records (
     UNIQUE (record_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_records_exhibit ON handover_records (exhibit_id, chain_seq);
+
+-- 摘要补正单：原交接记录与 record_hash 永不改写；补正按展品形成独立哈希链。
+-- 每环 prev_hash 指向上一补正单的 correction_hash（首环为 GENESIS），
+-- 同时以 target_record_hash 锚定被补正的原交接记录（锚错即补正链失效）。
+CREATE TABLE IF NOT EXISTS digest_corrections (
+    correction_id        UUID        PRIMARY KEY,
+    idempotency_key      TEXT        NOT NULL,          -- 调用方幂等键（与批次幂等键分表互不冲突）
+    exhibit_id           TEXT        NOT NULL REFERENCES exhibits (exhibit_id),
+    target_chain_seq     BIGINT      NOT NULL,          -- 被补正记录在交接链上的链序号
+    expected_digest      TEXT        NOT NULL,          -- 提交方预期的「当前有效摘要」
+    new_digest           TEXT        NOT NULL,          -- 补正后的新摘要
+    reason               TEXT        NOT NULL,          -- 补正原因（非空）
+    target_record_hash   TEXT        NOT NULL,          -- 锚定：被补正原记录的 record_hash
+    original_digest      TEXT        NOT NULL,          -- 锚定：被补正原记录的原始摘要（快照，不随后续补正变化）
+    correction_seq       BIGINT      NOT NULL,          -- 展品级补正链序号（1 起，连续）
+    prev_hash            TEXT        NOT NULL,          -- 前一环 correction_hash（首环为 GENESIS）
+    correction_hash      TEXT        NOT NULL,          -- 本环哈希（含 prev_hash 与原记录锚点）
+    request_hash         TEXT        NOT NULL,          -- 请求体指纹（同键不同载荷 -> 409）
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exhibit_id, correction_seq),
+    UNIQUE (correction_hash)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_corrections_idempotency_key
+    ON digest_corrections (idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_corrections_exhibit
+    ON digest_corrections (exhibit_id, correction_seq);
+CREATE INDEX IF NOT EXISTS idx_corrections_target
+    ON digest_corrections (exhibit_id, target_chain_seq, correction_seq);
 
 -- 种子数据：两件已登记展品，便于开箱即测
 INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal)
