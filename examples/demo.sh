@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端调用示例：登记展品 -> 预演 -> 凭令牌提交 -> 幂等重试 -> 冲突检测 ->
-# 提交违规批次（不落记录）-> 令牌失效与重新预演 -> 查询交接链 -> 哈希链审计校验。
+# 提交违规批次（不落记录）-> 令牌失效与重新预演 -> 查询交接链 -> 哈希链审计校验 ->
+# 凭证摘要补正（拒绝/冲突/幂等/独立补正链）-> 双链审计。
 # 用法：BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -17,6 +18,13 @@ EXHIBIT_ID="EX-DEMO-$(date +%s)"
 KEY_OK="demo-ok-${EXHIBIT_ID}"
 KEY_BAD="demo-bad-${EXHIBIT_ID}"
 KEY_RH="demo-rh-${EXHIBIT_ID}"
+
+# 补正用摘要（均为合法 sha256:<64hex>）
+D_ORIG="sha256:7f8e9d0c1b2a39485766a5b4c3d2e1f00918273645564738291a0b1c2d3e4f506"
+D_NEW1="sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00918273645564738291a0b1c2d3e4f50"
+D_NEW2="sha256:5566778899aabbccddeeff00112233445566778899aabbccddeeff0011223344"
+KEY_C1="demo-corr1-${EXHIBIT_ID}"
+KEY_C2="demo-corr2-${EXHIBIT_ID}"
 
 echo "== 0) 健康检查 =="
 curl -s "${BASE}/health" | pp
@@ -147,3 +155,66 @@ curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/audit/verify" | pp
 
 echo; echo "== 11) 批次历史（含被驳回批次，供审计追溯；409/400 不产生报告）=="
 curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batches" | pp
+
+echo; echo "== 12) 补正第 3 环凭证摘要（原摘要 -> 新摘要）：201，锚定原记录 record_hash =="
+curl -s -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C1}" \
+  -d "{\"expected_digest\":\"${D_ORIG}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"凭证摘要录入笔误，据馆方复核原件更正（复核单 CR-2026-1001）\"}" | pp
+
+echo; echo "== 13) 同键同载荷重试：返回原补正单（200, idempotent_replay=true）=="
+curl -s -D /tmp/corr13.hdr -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C1}" \
+  -d "{\"expected_digest\":\"${D_ORIG}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"凭证摘要录入笔误，据馆方复核原件更正（复核单 CR-2026-1001）\"}" | pp
+grep -i '^HTTP/' /tmp/corr13.hdr
+
+echo; echo "== 14) 旧预期值再补 -> 409（当前有效摘要已是 ${D_NEW1:0:18}...）=="
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-corr-stale-${EXHIBIT_ID}" \
+  -d "{\"expected_digest\":\"${D_ORIG}\",\"new_digest\":\"${D_NEW2}\",\"reason\":\"再次补正\"}"
+
+echo; echo "== 15) 以当前有效摘要为预期继续补正：201（补正链第 2 环，prev_hash 接第 1 环）=="
+curl -s -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C2}" \
+  -d "{\"expected_digest\":\"${D_NEW1}\",\"new_digest\":\"${D_NEW2}\",\"reason\":\"二次复核再更正（复核单 CR-2026-1002）\"}" | pp
+
+echo; echo "== 16) 拒绝用例：目标不存在(404) / 原因空缺(422) / 新旧相同(422) / 同键异载荷(409) =="
+curl -s -o /dev/null -w '目标链序号 999 不存在        -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/999/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-corr-miss-${EXHIBIT_ID}" \
+  -d "{\"expected_digest\":\"${D_NEW2}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"x\"}"
+curl -s -o /dev/null -w '原因空缺                     -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-corr-empty-${EXHIBIT_ID}" \
+  -d "{\"expected_digest\":\"${D_NEW2}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"   \"}"
+curl -s -o /dev/null -w '新旧摘要相同                 -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-corr-same-${EXHIBIT_ID}" \
+  -d "{\"expected_digest\":\"${D_NEW2}\",\"new_digest\":\"${D_NEW2}\",\"reason\":\"x\"}"
+curl -s -o /dev/null -w '同键异载荷                   -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_C1}" \
+  -d "{\"expected_digest\":\"${D_NEW2}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"换一个载荷\"}"
+
+echo; echo "== 17) 交接链查询：原摘要 voucher_digest 不变，current_voucher_digest 为最新，补正轨迹两环 =="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers" | pp
+
+echo; echo "== 18) 单环节查询（原摘要 / 当前有效摘要 / 补正轨迹）=="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3" | pp
+
+echo; echo "== 19) 补正链列表（可按链序号过滤）=="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/digest-corrections" | pp
+
+echo; echo "== 20) 双链审计复算（交接链 + 补正链；补正不推进交接链，预演令牌不受影响）=="
+curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/audit/verify" | pp
+
+echo; echo "== 21) 幂等优先于现状：即便当前有效摘要已是 ${D_NEW2:0:14}... ，用 ${KEY_C1} 原载荷仍重放原单 =="
+curl -s -D /tmp/corr21.hdr -X POST "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/handovers/3/digest-corrections" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_C1}" \
+  -d "{\"expected_digest\":\"${D_ORIG}\",\"new_digest\":\"${D_NEW1}\",\"reason\":\"凭证摘要录入笔误，据馆方复核原件更正（复核单 CR-2026-1001）\"}" | pp
+grep -i '^HTTP/' /tmp/corr21.hdr
+

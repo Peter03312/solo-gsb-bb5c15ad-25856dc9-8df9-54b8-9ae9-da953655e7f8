@@ -33,6 +33,19 @@ class BatchRequest(BaseModel):
     records: list[HandoverIn] = Field(min_length=1, max_length=1000, description="按时间排列的交接记录")
 
 
+# ---------------------------------------------------------------- 凭证摘要补正
+
+
+class CorrectionRequest(BaseModel):
+    """凭证摘要补正单（原交接记录与其 record_hash 永不改写，只追加补正）。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    expected_digest: str = Field(min_length=1, max_length=200, description="预期当前有效摘要（与现状不符 -> 409 冲突）")
+    new_digest: str = Field(min_length=1, max_length=200, description="新摘要（须为 算法:十六进制；与当前有效摘要相同 -> 422 拒绝）")
+    reason: str = Field(min_length=1, max_length=500, description="补正原因（非空；空缺 -> 422 拒绝）")
+
+
 class ReasonOut(BaseModel):
     rule: str
     message: str
@@ -83,6 +96,9 @@ class ExhibitOut(BaseModel):
     chain_length: int
     chain_head_hash: str
     created_at: datetime
+    # 补正链状态（新增字段；补正不推进交接链，故上面 chain_length/chain_head_hash 不变）
+    correction_chain_length: Optional[int] = 0
+    correction_head_hash: Optional[str] = None
 
 
 class HandoverRecordOut(BaseModel):
@@ -100,6 +116,54 @@ class HandoverRecordOut(BaseModel):
     prev_hash: str
     record_hash: str
     created_at: datetime
+    # 补正引入的新字段（原字段保持不变，向后兼容）：
+    # 当前有效摘要（无补正则等于原 voucher_digest）与该环节的补正轨迹
+    current_voucher_digest: Optional[str] = None
+    correction_trail: list["CorrectionTrailItem"] = Field(default_factory=list)
+
+
+class CorrectionTrailItem(BaseModel):
+    """交接查询中某环节的补正轨迹条目（按补正时序）。"""
+
+    correction_id: str
+    correction_seq: int
+    target_chain_seq: int
+    expected_digest: str
+    old_digest: str
+    new_digest: str
+    reason: str
+    anchor_record_hash: str
+    record_hash: str
+    idempotent_replay: bool
+    created_at: datetime
+
+
+class CorrectionOut(BaseModel):
+    """补正单（首次提交 201；同键同载荷重放 200）。"""
+
+    correction_id: str
+    exhibit_id: str
+    target_chain_seq: int
+    expected_digest: str
+    old_digest: str
+    new_digest: str
+    reason: str
+    anchor_record_hash: str
+    correction_seq: int
+    prev_hash: str
+    record_hash: str
+    idempotent_replay: bool
+    created_at: datetime
+
+
+class ChainAuditBlock(BaseModel):
+    """审计复算结果中的一条链（交接链 / 补正链）。"""
+
+    chain_length: int
+    head_hash: Optional[str] = Field(default=None, description="复算得到的链尾哈希")
+    valid: bool
+    first_invalid_seq: Optional[int] = None
+    detail: str
 
 
 class ChainOut(BaseModel):
@@ -114,6 +178,10 @@ class AuditVerifyOut(BaseModel):
     valid: bool
     first_invalid_seq: Optional[int]
     detail: str
+    # 补正引入：同时复算交接链与补正链（新增字段，不改动原有字段，向后兼容）
+    correction_chain_length: Optional[int] = 0
+    corrections_chain: Optional[ChainAuditBlock] = None
+    handover_chain: Optional[ChainAuditBlock] = None
 
 
 class BatchSummary(BaseModel):
@@ -144,3 +212,7 @@ class RehearsalOut(BaseModel):
     items: list[ItemOut]
     rehearsed_at: datetime
     state_token: HandoverTokenOut
+
+
+# HandoverRecordOut 前向引用了稍后定义的 CorrectionTrailItem，显式重绑模型
+HandoverRecordOut.model_rebuild()

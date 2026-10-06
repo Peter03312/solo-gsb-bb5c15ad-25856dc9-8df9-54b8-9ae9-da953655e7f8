@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 # 每条展品审计链的创世前驱哈希
 GENESIS_HASH = "GENESIS"
+# 补正链独立的创世前驱哈希：补正按展品另起一条链，不接在交接链尾
+CORRECTIONS_GENESIS_HASH = "CORRECTIONS_GENESIS"
 
 
 def canonical_json(obj) -> bytes:
@@ -71,5 +73,62 @@ def record_hash(
         "seal_change_reason": seal_change_reason or "",
         "occurred_at": norm_ts(occurred_at),
         "voucher_digest": voucher_digest,
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def correction_request_hash(
+    exhibit_id: str,
+    target_chain_seq: int,
+    expected_digest: str,
+    new_digest: str,
+    reason: str,
+) -> str:
+    """补正单请求体指纹：用于幂等键下检测「同键不同载荷」。"""
+    payload = {
+        "exhibit_id": exhibit_id,
+        "target_chain_seq": int(target_chain_seq),
+        "expected_digest": expected_digest,
+        "new_digest": new_digest,
+        "reason": reason,
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def correction_hash(
+    *,
+    prev_hash: str,
+    correction_id,
+    exhibit_id: str,
+    correction_seq: int,
+    target_chain_seq: int,
+    expected_digest: str,
+    old_digest: str,
+    new_digest: str,
+    reason: str,
+    anchor_record_hash: str,
+    created_at: datetime,
+) -> str:
+    """单张补正单的链式哈希：
+
+        correction_hash = sha256(prev_hash ‖ 补正业务字段 ‖ 被补正原记录哈希锚点)
+
+    补正链按展品独立成链（首环 prev_hash = CORRECTIONS_GENESIS），
+    每环显式锚定被补正交接记录的 record_hash：
+    原记录被篡改、补正单被改写、删除或乱序，都会使补正链复算失败。
+    """
+    payload = {
+        "prev_hash": prev_hash,
+        "kind": "digest_correction",
+        "correction_id": str(correction_id),
+        "exhibit_id": exhibit_id,
+        "correction_seq": correction_seq,
+        "target_chain_seq": int(target_chain_seq),
+        "expected_digest": expected_digest,
+        "old_digest": old_digest,
+        "new_digest": new_digest,
+        "reason": (reason or "").strip(),
+        "anchor_record_hash": anchor_record_hash,
+        "created_at": norm_ts(created_at),
     }
     return sha256_hex(canonical_json(payload))

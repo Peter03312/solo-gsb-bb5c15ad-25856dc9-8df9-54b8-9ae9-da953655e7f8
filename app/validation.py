@@ -73,6 +73,11 @@ class ValidationResult:
         return None
 
 
+def is_valid_voucher_digest(value: str | None) -> bool:
+    """凭证摘要是否符合「算法:十六进制摘要」格式（补正接口复用同一判定）。"""
+    return bool(value) and bool(VOUCHER_RE.match(value))
+
+
 def validate_batch(state: ExhibitState, records: list) -> ValidationResult:
     """校验整批交接记录。records 元素需具备 location/from_person/to_person/
     seal_no/occurred_at/voucher_digest/seal_change_reason 属性。"""
